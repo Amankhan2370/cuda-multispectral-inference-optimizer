@@ -1,0 +1,27 @@
+# Build
+build/
+cmake-build-*/
+*.o
+*.obj
+*.a
+*.so
+*.exe
+benchmark
+
+# IDE / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+
+# Nsight / profiling (optional)
+*.ncu-rep
+*.nsys-rep
