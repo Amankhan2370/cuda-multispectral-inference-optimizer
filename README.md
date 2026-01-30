@@ -1,137 +1,200 @@
-# CUDA Multispectral Inference Optimizer
+<p align="center">
+  <strong>CUDA Multispectral Inference Optimizer</strong>
+</p>
+<p align="center">
+  Inference-optimized CUDA kernels for multispectral preprocess, layout transforms, and benchmarking.
+</p>
 
-This repository contains CUDA kernels and tooling for optimizing multispectral image preprocess and layout transforms in inference pipelines. The focus is on latency and memory efficiency at deployment time: per-channel normalization, NHWC–NCHW layout conversion, and a fused preprocess kernel that combines these steps. No training code is included. This is inference-only and reflects the kind of work you see in production AI infrastructure (preprocess, layout, and benchmarking on GPU).
+<p align="center">
+  <a href="https://developer.nvidia.com/cuda-toolkit"><img src="https://img.shields.io/badge/CUDA-12.x-76B900?style=flat-square&logo=nvidia&logoColor=white" alt="CUDA 12.x"/></a>
+  <a href="https://isocpp.org"><img src="https://img.shields.io/badge/C%2B%2B-17-00599C?style=flat-square&logo=cplusplus&logoColor=white" alt="C++17"/></a>
+  <a href="https://cmake.org"><img src="https://img.shields.io/badge/CMake-3.18%2B-064F8C?style=flat-square&logo=cmake&logoColor=white" alt="CMake 3.18+"/></a>
+  <a href="https://www.python.org"><img src="https://img.shields.io/badge/Python-3.10%2B-3776AB?style=flat-square&logo=python&logoColor=white" alt="Python 3.10+"/></a>
+  <a href="https://pytorch.org"><img src="https://img.shields.io/badge/PyTorch-baseline-EE4C2C?style=flat-square&logo=pytorch&logoColor=white" alt="PyTorch"/></a>
+  <a href="#license"><img src="https://img.shields.io/badge/License-MIT-yellow?style=flat-square" alt="License MIT"/></a>
+</p>
+
+---
+
+## Table of contents
+
+- [Overview](#overview)
+- [Problem](#problem)
+- [Components](#components)
+- [Architecture](#architecture)
+- [Tools and requirements](#tools-and-requirements)
+- [Repository structure](#repository-structure)
+- [Quick start](#quick-start)
+- [Build](#build)
+- [Benchmarks](#benchmarks)
+- [Profiling](#profiling)
+- [Security and credentials](#security-and-credentials)
+- [License](#license)
 
 ---
 
 ## Overview
 
-Multispectral and hyperspectral inputs (e.g. multiple bands per pixel) are common in remote sensing and specialized vision pipelines. Before running a model, data is usually normalized per channel and converted from sensor-friendly layouts (e.g. NHWC) to framework-friendly ones (NCHW). Doing this with many small kernel launches and temporary buffers can dominate latency. This project provides minimal, compilable scaffolding for custom CUDA kernels that perform normalization and layout transform, plus a stub for a single fused kernel, so you can measure and optimize preprocess cost on your own hardware.
+Multispectral and hyperspectral inputs (multiple bands per pixel) are common in remote sensing and specialized vision. Inference pipelines typically normalize per channel and convert sensor layouts (e.g. NHWC) to framework layouts (NCHW). Multiple kernel launches and temporary buffers can dominate latency. This repository provides minimal, compilable CUDA scaffolding: per-channel normalization, NHWC→NCHW layout transform, and a fused preprocess stub. Inference-only; no training code.
 
 ---
 
-## Why multispectral inference is hard
+## Problem
 
-**Memory:** Multispectral tensors are large (batch × channels × height × width). Multiple passes (normalize, then layout) double or triple device memory traffic and require intermediate buffers. Bandwidth, not compute, often limits throughput.
-
-**Latency:** Many small kernels mean more launch overhead and more round-trips to global memory. For real-time or low-latency serving, preprocess can be a significant fraction of total inference time. Fusing steps into fewer kernels reduces launches and improves arithmetic intensity.
-
----
-
-## What this project demonstrates
-
-- **Per-channel normalization** in a single CUDA kernel with coalescing-friendly indexing and grid-stride loops.
-- **NHWC → NCHW layout transform** as a dedicated kernel, with no hardcoded dimensions, suitable for plugging into inference graphs.
-- **Fused preprocess stub** that conceptually combines normalization, optional spectral weighting, and layout transform in one kernel (structure only; optimization left to you).
-- **Baseline comparison** via a PyTorch inference-only script that runs the same operations with torch ops so you can compare latency.
-- **C++ benchmark driver** that times the CUDA kernels with CUDA events and prints placeholder metrics.
-- **Profiling workflow** documented in Markdown (Nsight Systems / Compute) with placeholders for your own screenshots and numbers.
+| Factor | Impact |
+|--------|--------|
+| **Memory** | Large tensors (N×C×H×W). Multiple passes increase device traffic and intermediate buffers; bandwidth often limits throughput. |
+| **Latency** | Many small kernels add launch overhead and extra global memory round-trips. Preprocess can be a large fraction of total inference time; fusion reduces launches and improves arithmetic intensity. |
 
 ---
 
-## Architecture overview
+## Components
 
-**Baseline:** PyTorch on GPU (or CPU): generate dummy multispectral tensor, normalize per channel with `mean`/`var`, optionally permute for layout. Good for sanity-checking correctness and getting a latency reference.
-
-**Optimized path:** Custom CUDA kernels: `spectral_normalize.cu` (normalize), `layout_transform.cu` (NHWC→NCHW), and `fused_preprocess.cu` (stub for a single fused kernel). The C++ benchmark links these and measures them with CUDA events. You can replace the stub with a real fused implementation and compare against the baseline and the separate kernels.
+| Component | Description |
+|-----------|-------------|
+| `spectral_normalize.cu` | Per-channel normalization; coalescing-friendly indexing, grid-stride loops. |
+| `layout_transform.cu` | NHWC → NCHW; no hardcoded dimensions; suitable for inference graphs. |
+| `fused_preprocess.cu` | Stub: normalize + optional spectral weighting + layout in one kernel (structure only). |
+| `pytorch_pipeline.py` | PyTorch inference-only baseline (normalize + permute) for correctness and latency reference. |
+| `benchmark.cpp` | C++ driver; CUDA events; warmup + repeat; reports ms/iter for each kernel path. |
+| `profiling/analysis.md` | Template for Nsight Systems / Compute results and screenshots. |
 
 ---
 
-## CUDA techniques used
+## Architecture
 
-- **Grid-stride loops** in the normalization kernel so that total thread count is independent of problem size and occupancy stays reasonable.
-- **Coalesced global memory access** by design: threads in a warp map to contiguous channel/spatial indices where applicable so that loads/stores are coalesced.
-- **No hardcoded dimensions** in the layout or fused kernels; N, C, H, W are passed as kernel arguments so the same code works for different input sizes.
-- **Kernel fusion (stub)** to illustrate a single kernel that would do normalize + optional weighting + layout in one pass, reducing global memory round-trips and launch overhead.
-- **CUDA events** in the benchmark for host-synchronized timing of kernel execution.
+**Pipeline (conceptual)**
+
+```text
+  Input (NHWC)  →  Normalize (per channel)  →  [Optional: spectral weight]  →  Layout (NCHW)  →  Output
+```
+
+**Baseline (PyTorch)**  
+Dummy multispectral tensor → per-channel `mean`/`var` normalize → permute for layout. Used for correctness and latency baseline.
+
+**Optimized path (CUDA)**  
+Three kernel entry points: `spectral_normalize`, `layout_transform`, `fused_preprocess`. The C++ benchmark links all three and times each path. Replace the fused stub with a real implementation and compare against baseline and separate kernels.
+
+**CUDA techniques used**
+
+| Technique | Purpose |
+|-----------|---------|
+| Grid-stride loops | Normalization kernel scales with problem size; keeps occupancy reasonable. |
+| Coalesced global access | Warp threads map to contiguous channel/spatial indices where applicable. |
+| Dimension-agnostic kernels | N, C, H, W passed as arguments; one implementation for arbitrary sizes. |
+| Kernel fusion (stub) | Single kernel for normalize + weighting + layout to reduce round-trips and launch overhead. |
+| CUDA events | Host-synchronized timing in the benchmark for kernel execution. |
+
+---
+
+## Tools and requirements
+
+| Tool | Version | Purpose |
+|------|---------|---------|
+| CUDA Toolkit | 12.x | Kernels, runtime, CUDA events |
+| CMake | 3.18+ | Configure and build C++/CUDA |
+| C++ compiler | C++17 | Benchmark driver and host code |
+| Python | 3.10+ | Optional; PyTorch baseline |
+| PyTorch | (CUDA build optional) | Baseline pipeline |
+| Nsight Systems | — | Timeline profiling |
+| Nsight Compute | — | Per-kernel analysis |
+
+No other dependencies for the C++/CUDA build.
 
 ---
 
 ## Repository structure
 
-```
+```text
 cuda-multispectral-inference-optimizer/
 ├── kernels/
-│   ├── spectral_normalize.cu   # Per-channel normalization kernel
-│   ├── layout_transform.cu     # NHWC → NCHW
-│   └── fused_preprocess.cu     # Fused preprocess stub
+│   ├── spectral_normalize.cu
+│   ├── layout_transform.cu
+│   └── fused_preprocess.cu
 ├── baseline/
-│   └── pytorch_pipeline.py      # PyTorch inference-only baseline
+│   └── pytorch_pipeline.py
 ├── include/
-│   └── cuda_utils.h             # CUDA error-checking macros
+│   └── cuda_utils.h
 ├── benchmarks/
-│   └── benchmark.cpp           # C++ CUDA benchmark driver
+│   └── benchmark.cpp
 ├── profiling/
-│   └── analysis.md              # Profiling notes and placeholders
+│   └── analysis.md
 ├── CMakeLists.txt
 └── README.md
 ```
 
 ---
 
-## How to build
-
-Requirements: CUDA toolkit, CMake 3.18+, and a C++17-capable compiler. No other dependencies.
+## Quick start
 
 ```bash
+git clone https://github.com/Amankhan2370/cuda-multispectral-inference-optimizer.git
 cd cuda-multispectral-inference-optimizer
+mkdir build && cd build
+cmake .. && cmake --build .
+./benchmark 4 8 224 224
+```
+
+---
+
+## Build
+
+From the repository root:
+
+```bash
 mkdir build && cd build
 cmake ..
 cmake --build .
 ```
 
-The executable `benchmark` is built in the build directory and links the three kernel libraries.
+Artifact: `build/benchmark` (links the three kernel libraries).
 
 ---
 
-## How to run benchmarks
+## Benchmarks
 
-From the build directory:
+| Command | Description |
+|---------|-------------|
+| `./benchmark` | Default shape (N=4, C=8, H=224, W=224). |
+| `./benchmark N C H W` | Custom batch, channels, height, width. |
 
-```bash
-./benchmark
-```
+Warmup then timed iterations for each kernel path; output is ms/iter. Requires a CUDA-capable GPU.
 
-Optional arguments: `N C H W` (batch, channels, height, width). Example:
-
-```bash
-./benchmark 4 8 224 224
-```
-
-The program runs warmup iterations, then timed iterations for each of the three kernel paths and prints placeholder timing (ms/iter). Run on a machine with a CUDA-capable GPU; results depend on your driver and GPU.
-
-PyTorch baseline (for comparison):
+**PyTorch baseline (optional)**
 
 ```bash
 python baseline/pytorch_pipeline.py
 ```
 
-Requires PyTorch and a CUDA-enabled build if you want GPU timing.
+Requires PyTorch; use a CUDA build for GPU timing.
 
 ---
 
-## Profiling workflow
+## Profiling
 
-Use **NVIDIA Nsight Systems** for timeline profiling (kernel launch count, overlap, host/device sync). Use **Nsight Compute** for per-kernel metrics (occupancy, memory throughput, warp execution).
+| Tool | Use |
+|------|-----|
+| **Nsight Systems** | Timeline: kernel count, overlap, host/device sync. |
+| **Nsight Compute** | Per-kernel: occupancy, memory throughput, warp utilization. |
 
-1. Capture a trace that includes the benchmark runs (or your own harness).
-2. Identify the dominant kernels and any unnecessary syncs or small launches.
-3. Compare baseline (PyTorch or separate kernels) vs the fused kernel once implemented.
-4. Fill in `profiling/analysis.md` with screenshots and numbers from your runs. Do not invent results; the template uses placeholders like "Insert Nsight screenshot here".
+1. Capture a trace of the benchmark (or your harness).
+2. Identify dominant kernels and unnecessary syncs or small launches.
+3. Compare baseline vs separate kernels vs fused kernel once implemented.
+4. Document results in `profiling/analysis.md` (placeholders provided; do not invent numbers).
 
 ---
 
 ## Security and credentials
 
-This project does not contain credentials, API keys, or secrets. Any placeholders that might later hold paths or keys are marked in code with comments such as:
+No credentials, API keys, or secrets are included. Placeholders for user-supplied values are marked in code, e.g.:
 
 - `# add your api key here`
 - `# add your model or weights here if needed`
 
-Do not commit real keys or paths. Keep configuration and secrets outside the repository.
+Do not commit real keys or paths; keep them outside the repository.
 
 ---
 
-## Who this project is for
+## License
 
-Senior engineers and ML infrastructure engineers who work on inference pipelines, GPU performance, or multispectral/hyperspectral deployment. The code is minimal on purpose: it compiles, runs, and illustrates structure and intent. You are expected to tune block/grid sizes, add real fused logic, and plug in your own data paths and model interfaces. It is not a training codebase and does not implement learning; it is focused on inference, CUDA kernels, benchmarking, and profiling.
+MIT.
